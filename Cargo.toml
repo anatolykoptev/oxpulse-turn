@@ -1,0 +1,12 @@
+[package]
+name = "oxpulse-turn"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "TURN credential generation for OxPulse"
+
+[dependencies]
+base64 = "0.22"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
