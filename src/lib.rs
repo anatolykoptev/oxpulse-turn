@@ -46,8 +46,7 @@ pub fn generate_credentials(
 
     let username = format!("{expiry}:{user_id}");
 
-    let mut mac =
-        HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(username.as_bytes());
     let credential = BASE64.encode(mac.finalize().into_bytes());
 
