@@ -25,12 +25,21 @@ pub struct TurnCredentials {
     pub credential: String,
     pub ttl: u64,
     pub ice_servers: Vec<IceServer>,
+    /// WebRTC `RTCPeerConnection` `iceTransportPolicy`. Server decides whether
+    /// the client should use all candidates (`"all"`) or force TURN relay only
+    /// (`"relay"`) to hide client IPs. Task 4.3.
+    #[serde(rename = "iceTransportPolicy")]
+    pub ice_transport_policy: &'static str,
 }
 
 /// Generate temporary TURN credentials using HMAC-SHA1.
 ///
 /// Username format: `{unix_expiry}:{user_id}`
 /// Credential: `base64(HMAC-SHA1(secret, username))`
+///
+/// `ice_transport_policy` defaults to `"all"`. Callers (see
+/// `server/router.rs`) may override it after construction using struct update
+/// syntax when they want to force relay.
 pub fn generate_credentials(
     secret: &str,
     user_id: &str,
@@ -73,6 +82,7 @@ pub fn generate_credentials(
         credential,
         ttl: ttl.as_secs(),
         ice_servers,
+        ice_transport_policy: "all",
     }
 }
 
@@ -114,5 +124,11 @@ mod tests {
         assert_eq!(creds.ice_servers.len(), 1);
         assert!(creds.ice_servers[0].username.is_none());
         assert!(creds.ice_servers[0].credential.is_none());
+    }
+
+    #[test]
+    fn default_ice_transport_policy_is_all() {
+        let creds = generate_credentials("secret", "user", Duration::from_secs(60), &[], &[]);
+        assert_eq!(creds.ice_transport_policy, "all");
     }
 }
