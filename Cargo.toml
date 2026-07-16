@@ -2,9 +2,13 @@
 name = "oxpulse-turn"
 version = "0.1.0"
 edition = "2021"
-publish = false
+publish = true
 license = "AGPL-3.0-or-later"
-description = "TURN credential generation for OxPulse"
+description = "TURN/STUN credential generation (coturn REST API compatible HMAC-SHA1) for WebRTC ICE negotiation"
+repository = "https://github.com/anatolykoptev/oxpulse-chat"
+homepage = "https://oxpulse.chat"
+keywords = ["turn", "stun", "webrtc", "ice", "coturn"]
+categories = ["network-programming", "cryptography"]
 
 [dependencies]
 base64 = "0.22"
