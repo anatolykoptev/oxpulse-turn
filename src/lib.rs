@@ -1,3 +1,32 @@
+//! Short-lived TURN/STUN credentials for WebRTC ICE, compatible with the
+//! [coturn](https://github.com/coturn/coturn) REST-API time-limited credential
+//! scheme (`use-auth-secret` / `static-auth-secret`).
+//!
+//! A caller holding a secret shared with the TURN server mints an ephemeral
+//! `username` / `credential` pair that any coturn instance configured with the
+//! same secret accepts — no per-user state on the TURN server, no database
+//! round-trip. The credential is `base64(HMAC-SHA1(secret, "<expiry>:<user>"))`,
+//! exactly the format coturn's `--use-auth-secret` validates.
+//!
+//! # Example
+//!
+//! ```
+//! use std::time::Duration;
+//! use oxpulse_turn::generate_credentials;
+//!
+//! let creds = generate_credentials(
+//!     "shared-secret-configured-on-coturn",
+//!     "alice",
+//!     Duration::from_secs(3600),
+//!     &["turn:turn.example.com:3478?transport=udp".to_string()],
+//!     &["stun:stun.example.com:3478".to_string()],
+//! );
+//!
+//! assert!(creds.username.ends_with(":alice"));
+//! assert_eq!(creds.ttl, 3600);
+//! assert_eq!(creds.ice_servers.len(), 2);
+//! ```
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
