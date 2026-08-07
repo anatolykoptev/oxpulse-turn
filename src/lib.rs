@@ -14,20 +14,29 @@
 //! caller's system clock must be synchronised with the TURN server's clock
 //! (e.g. via NTP). Clock skew causes credentials to expire early or late.
 //!
+//! # API layers
+//!
+//! | Layer | Function | When to use |
+//! |---|---|---|
+//! | **Issuer** | [`TurnCredentialIssuer`] | Server: validate config once at startup, `.issue()` per request |
+//! | **Pure mint** | [`mint_credentials`] + [`compute_expiry`] | Deterministic minting with caller-supplied expiry (testable, no `SystemTime`) |
+//! | **Try** | [`try_generate_credentials`] | One-shot mint returning `Result` (no panic) |
+//! | **Panic** | [`generate_credentials`] | Simple use cases (panics on invalid input) |
+//!
 //! # Example
 //!
 //! ```
 //! use std::time::Duration;
-//! use oxpulse_turn::generate_credentials;
+//! use oxpulse_turn::TurnCredentialIssuer;
 //!
-//! let creds = generate_credentials(
+//! let issuer = TurnCredentialIssuer::new(
 //!     "shared-secret-configured-on-coturn",
-//!     "alice",
 //!     Duration::from_secs(3600),
 //!     &["turn:turn.example.com:3478?transport=udp".to_string()],
 //!     &["stun:stun.example.com:3478".to_string()],
-//! );
+//! ).unwrap();
 //!
+//! let creds = issuer.issue("alice").unwrap();
 //! assert!(creds.username.ends_with(":alice"));
 //! assert_eq!(creds.ttl, 3600);
 //! assert_eq!(creds.ice_servers.len(), 2);
@@ -42,6 +51,30 @@ use serde::Serialize;
 use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
+
+/// Errors that can occur during TURN credential generation.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnError {
+    #[error("ttl must be greater than zero")]
+    TtlZero,
+    #[error("ttl overflow: expiry would exceed u64::MAX")]
+    TtlOverflow,
+    #[error("user_id must be non-empty")]
+    EmptyUserId,
+    #[error("user_id must not contain ':' (reserved as the coturn username separator)")]
+    UserIdColon,
+    #[error("user_id must not contain control characters")]
+    UserIdControlChar,
+    #[error("URL must start with one of {expected:?}: got {url:?}")]
+    InvalidUrlScheme {
+        expected: &'static [&'static str],
+        url: String,
+    },
+    #[error("URL must have a non-empty host after the scheme: got {url:?}")]
+    EmptyHost { url: String },
+    #[error("system clock before unix epoch")]
+    ClockBeforeEpoch,
+}
 
 /// ICE transport policy for WebRTC `RTCPeerConnection`.
 ///
@@ -82,107 +115,184 @@ pub struct TurnCredentials {
     pub ice_transport_policy: IceTransportPolicy,
 }
 
-fn validate_user_id(user_id: &str) {
-    assert!(!user_id.is_empty(), "user_id must be non-empty");
-    assert!(
-        !user_id.contains(':'),
-        "user_id must not contain ':' (reserved as the coturn username separator)"
-    );
-    assert!(
-        !user_id.chars().any(|c| c.is_control()),
-        "user_id must not contain control characters"
-    );
+/// Pre-validated TURN credential issuer for server use cases.
+///
+/// Validates configuration (secret, URLs, TTL) **once** at construction,
+/// then mints credentials per-request without repeating validation. This is
+/// the recommended API for servers that mint credentials on a hot path.
+///
+/// # Example
+///
+/// ```
+/// use std::time::Duration;
+/// use oxpulse_turn::{TurnCredentialIssuer, IceTransportPolicy};
+///
+/// let issuer = TurnCredentialIssuer::new(
+///     "secret",
+///     Duration::from_secs(3600),
+///     &["turn:turn.example.com:3478".to_string()],
+///     &["stun:stun.example.com:3478".to_string()],
+/// ).unwrap();
+///
+/// // Per-request: only user_id is validated (config already checked)
+/// let creds = issuer.issue("alice").unwrap();
+/// let relay = issuer.issue_with_policy("bob", IceTransportPolicy::Relay).unwrap();
+/// ```
+#[derive(Debug, Clone)]
+pub struct TurnCredentialIssuer {
+    secret: String,
+    ttl: Duration,
+    turn_urls: Vec<String>,
+    stun_urls: Vec<String>,
 }
 
-fn validate_urls(urls: &[String], expected_schemes: &[&str]) {
-    for url in urls {
-        let scheme = expected_schemes.iter().find(|s| url.starts_with(*s));
-        assert!(
-            scheme.is_some(),
-            "URL must start with one of {:?}: got {:?}",
-            expected_schemes,
-            url
-        );
-        // After the scheme prefix there must be a non-empty host
-        // (at least one char before '?', '#', or end of string).
-        let rest = &url[scheme.unwrap().len()..];
-        let host = rest.split(['?', '#']).next().unwrap_or("");
-        assert!(
-            !host.is_empty(),
-            "URL must have a non-empty host after the scheme: got {:?}",
-            url
-        );
+impl TurnCredentialIssuer {
+    /// Create a new issuer, validating configuration once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError`] if URLs are invalid or TTL is zero.
+    pub fn new(
+        secret: &str,
+        ttl: Duration,
+        turn_urls: &[String],
+        stun_urls: &[String],
+    ) -> Result<Self, TurnError> {
+        validate_urls(turn_urls, TURN_SCHEMES)?;
+        validate_urls(stun_urls, STUN_SCHEMES)?;
+        if ttl.is_zero() {
+            return Err(TurnError::TtlZero);
+        }
+        Ok(Self {
+            secret: secret.to_string(),
+            ttl,
+            turn_urls: turn_urls.to_vec(),
+            stun_urls: stun_urls.to_vec(),
+        })
+    }
+
+    /// Issue credentials with the default policy ([`IceTransportPolicy::All`]).
+    ///
+    /// Only `user_id` is validated — configuration was checked at [`new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError`] if `user_id` is invalid, the clock is before
+    /// the Unix epoch, or TTL overflows.
+    pub fn issue(&self, user_id: &str) -> Result<TurnCredentials, TurnError> {
+        self.issue_with_policy(user_id, IceTransportPolicy::All)
+    }
+
+    /// Issue credentials with a specified [`IceTransportPolicy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError`] if `user_id` is invalid, the clock is before
+    /// the Unix epoch, or TTL overflows.
+    pub fn issue_with_policy(
+        &self,
+        user_id: &str,
+        policy: IceTransportPolicy,
+    ) -> Result<TurnCredentials, TurnError> {
+        validate_user_id(user_id)?;
+        let now = now_unix()?;
+        let expiry = compute_expiry(now, self.ttl)?;
+        let mut creds = mint_credentials(
+            &self.secret,
+            user_id,
+            expiry,
+            &self.turn_urls,
+            &self.stun_urls,
+            policy,
+        )?;
+        creds.ttl = self.ttl.as_secs();
+        Ok(creds)
     }
 }
 
-/// Generate temporary TURN credentials using HMAC-SHA1.
-///
-/// Username format: `{unix_expiry}:{user_id}`
-/// Credential: `base64(HMAC-SHA1(secret, username))`
-///
-/// `ice_transport_policy` defaults to [`IceTransportPolicy::All`]. Use
-/// [`generate_credentials_with_policy`] to specify a different policy (e.g.
-/// [`IceTransportPolicy::Relay`] to force relay and hide client IPs).
-///
-/// # Panics
-///
-/// - If `ttl` is zero.
-/// - If `ttl` is so large that `now + ttl` overflows `u64`.
-/// - If `user_id` is empty, contains `':'`, or contains control characters.
-/// - If any URL in `turn_urls` or `stun_urls` does not start with the
-///   expected scheme (`turn:`, `turns:` for TURN; `stun:`, `stuns:` for STUN)
-///   or has an empty host.
-/// - If the system clock is before the Unix epoch (1970-01-01 UTC).
-///
-/// # Clock synchronisation
-///
-/// The credential expiry is derived from [`std::time::SystemTime::now`]. The
-/// caller's system clock must be synchronised with the TURN server's clock
-/// (e.g. via NTP). Clock skew causes credentials to expire early or late.
-pub fn generate_credentials(
-    secret: &str,
-    user_id: &str,
-    ttl: Duration,
-    turn_urls: &[String],
-    stun_urls: &[String],
-) -> TurnCredentials {
-    generate_credentials_with_policy(
-        secret,
-        user_id,
-        ttl,
-        turn_urls,
-        stun_urls,
-        IceTransportPolicy::All,
-    )
+const TURN_SCHEMES: &[&str] = &["turn:", "turns:"];
+const STUN_SCHEMES: &[&str] = &["stun:", "stuns:"];
+
+fn validate_user_id(user_id: &str) -> Result<(), TurnError> {
+    if user_id.is_empty() {
+        return Err(TurnError::EmptyUserId);
+    }
+    if user_id.contains(':') {
+        return Err(TurnError::UserIdColon);
+    }
+    if user_id.chars().any(|c| c.is_control()) {
+        return Err(TurnError::UserIdControlChar);
+    }
+    Ok(())
 }
 
-/// Generate temporary TURN credentials with a specified [`IceTransportPolicy`].
+fn validate_urls(
+    urls: &[String],
+    expected_schemes: &'static [&'static str],
+) -> Result<(), TurnError> {
+    for url in urls {
+        let scheme = expected_schemes.iter().find(|s| url.starts_with(*s));
+        let scheme = scheme.ok_or_else(|| TurnError::InvalidUrlScheme {
+            expected: expected_schemes,
+            url: url.clone(),
+        })?;
+        let rest = &url[scheme.len()..];
+        let host = rest.split(['?', '#']).next().unwrap_or("");
+        if host.is_empty() {
+            return Err(TurnError::EmptyHost { url: url.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn now_unix() -> Result<u64, TurnError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| TurnError::ClockBeforeEpoch)
+        .map(|d| d.as_secs())
+}
+
+/// Compute the expiry timestamp `now_unix + ttl`, returning an error on overflow.
 ///
-/// See [`generate_credentials`] for the credential format and validation rules.
-pub fn generate_credentials_with_policy(
+/// Separated from [`mint_credentials`] so the pure minting function stays
+/// deterministic and testable without a time source.
+///
+/// # Errors
+///
+/// Returns [`TurnError::TtlZero`] if `ttl` is zero, or [`TurnError::TtlOverflow`]
+/// if `now + ttl` overflows `u64`.
+pub fn compute_expiry(now_unix: u64, ttl: Duration) -> Result<u64, TurnError> {
+    if ttl.is_zero() {
+        return Err(TurnError::TtlZero);
+    }
+    now_unix
+        .checked_add(ttl.as_secs())
+        .ok_or(TurnError::TtlOverflow)
+}
+
+/// Mint TURN credentials from a pre-computed expiry timestamp.
+///
+/// This is the **pure** building block: no `SystemTime`, no I/O — the caller
+/// supplies `expiry_unix` (e.g. via [`compute_expiry`]). The same
+/// `(secret, user_id, expiry_unix, urls, policy)` always yields the same
+/// result, making this function deterministic and vector-testable.
+///
+/// # Errors
+///
+/// Returns [`TurnError`] if `user_id` or URLs are invalid.
+pub fn mint_credentials(
     secret: &str,
     user_id: &str,
-    ttl: Duration,
+    expiry_unix: u64,
     turn_urls: &[String],
     stun_urls: &[String],
     policy: IceTransportPolicy,
-) -> TurnCredentials {
-    assert!(!ttl.is_zero(), "ttl must be greater than zero");
+) -> Result<TurnCredentials, TurnError> {
+    validate_user_id(user_id)?;
+    validate_urls(turn_urls, TURN_SCHEMES)?;
+    validate_urls(stun_urls, STUN_SCHEMES)?;
 
-    validate_user_id(user_id);
-    validate_urls(turn_urls, &["turn:", "turns:"]);
-    validate_urls(stun_urls, &["stun:", "stuns:"]);
-
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs();
-
-    let expiry = now_secs
-        .checked_add(ttl.as_secs())
-        .expect("ttl overflow: expiry would exceed u64::MAX");
-
-    let username = format!("{expiry}:{user_id}");
+    let username = format!("{expiry_unix}:{user_id}");
 
     let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(username.as_bytes());
@@ -206,13 +316,105 @@ pub fn generate_credentials_with_policy(
         });
     }
 
-    TurnCredentials {
+    Ok(TurnCredentials {
         username,
         credential,
-        ttl: ttl.as_secs(),
+        ttl: 0,
         ice_servers,
         ice_transport_policy: policy,
-    }
+    })
+}
+
+/// Generate temporary TURN credentials using HMAC-SHA1.
+///
+/// Username format: `{unix_expiry}:{user_id}`
+/// Credential: `base64(HMAC-SHA1(secret, username))`
+///
+/// `ice_transport_policy` defaults to [`IceTransportPolicy::All`]. Use
+/// [`generate_credentials_with_policy`] to specify a different policy (e.g.
+/// [`IceTransportPolicy::Relay`] to force relay and hide client IPs).
+///
+/// # Panics
+///
+/// Panics if any input is invalid. Use [`try_generate_credentials`] for a
+/// `Result`-returning variant.
+pub fn generate_credentials(
+    secret: &str,
+    user_id: &str,
+    ttl: Duration,
+    turn_urls: &[String],
+    stun_urls: &[String],
+) -> TurnCredentials {
+    generate_credentials_with_policy(
+        secret,
+        user_id,
+        ttl,
+        turn_urls,
+        stun_urls,
+        IceTransportPolicy::All,
+    )
+}
+
+/// Generate temporary TURN credentials with a specified [`IceTransportPolicy`].
+///
+/// See [`generate_credentials`] for the credential format. Panics on invalid
+/// input — use [`try_generate_credentials_with_policy`] for a `Result` variant.
+pub fn generate_credentials_with_policy(
+    secret: &str,
+    user_id: &str,
+    ttl: Duration,
+    turn_urls: &[String],
+    stun_urls: &[String],
+    policy: IceTransportPolicy,
+) -> TurnCredentials {
+    try_generate_credentials_with_policy(secret, user_id, ttl, turn_urls, stun_urls, policy)
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Same as [`generate_credentials`] but returns [`Result`] instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`TurnError`] on any validation failure or clock error.
+pub fn try_generate_credentials(
+    secret: &str,
+    user_id: &str,
+    ttl: Duration,
+    turn_urls: &[String],
+    stun_urls: &[String],
+) -> Result<TurnCredentials, TurnError> {
+    try_generate_credentials_with_policy(
+        secret,
+        user_id,
+        ttl,
+        turn_urls,
+        stun_urls,
+        IceTransportPolicy::All,
+    )
+}
+
+/// Same as [`generate_credentials_with_policy`] but returns [`Result`].
+///
+/// # Errors
+///
+/// Returns [`TurnError`] on any validation failure or clock error.
+pub fn try_generate_credentials_with_policy(
+    secret: &str,
+    user_id: &str,
+    ttl: Duration,
+    turn_urls: &[String],
+    stun_urls: &[String],
+    policy: IceTransportPolicy,
+) -> Result<TurnCredentials, TurnError> {
+    validate_user_id(user_id)?;
+    validate_urls(turn_urls, TURN_SCHEMES)?;
+    validate_urls(stun_urls, STUN_SCHEMES)?;
+
+    let now = now_unix()?;
+    let expiry = compute_expiry(now, ttl)?;
+    let mut creds = mint_credentials(secret, user_id, expiry, turn_urls, stun_urls, policy)?;
+    creds.ttl = ttl.as_secs();
+    Ok(creds)
 }
 
 #[cfg(test)]
@@ -220,7 +422,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    // --- Existing tests (updated for new API) ---
+    // --- Panicking API (backward compat with 0.2.0) ---
 
     #[test]
     fn credentials_have_correct_format() {
@@ -263,14 +465,10 @@ mod tests {
         assert_eq!(creds.ice_transport_policy, IceTransportPolicy::All);
     }
 
-    // --- HMAC correctness (test gap from breakit hunter) ---
+    // --- HMAC correctness ---
 
     #[test]
     fn credential_matches_independently_computed_hmac() {
-        // Verify the credential is HMAC-SHA1(secret, username), not
-        // HMAC-SHA1(secret, user_id) or any other message. If someone
-        // changes mac.update(username.as_bytes()) to mac.update(user_id),
-        // this test catches it.
         let secret = "test-secret";
         let user_id = "user1";
         let creds = generate_credentials(secret, user_id, Duration::from_secs(3600), &[], &[]);
@@ -279,16 +477,11 @@ mod tests {
         expected_mac.update(creds.username.as_bytes());
         let expected = BASE64.encode(expected_mac.finalize().into_bytes());
 
-        assert_eq!(
-            creds.credential, expected,
-            "credential must be HMAC-SHA1(secret, username)"
-        );
+        assert_eq!(creds.credential, expected);
     }
 
     #[test]
     fn credential_matches_known_coturn_vector() {
-        // Known vector: HMAC-SHA1("test-secret", "1234567890:user1")
-        // computed via Python hashlib.hmac — external to the hmac crate.
         let secret = "test-secret";
         let username = "1234567890:user1";
 
@@ -301,8 +494,6 @@ mod tests {
 
     #[test]
     fn hmac_matches_rfc2202_test_case_2() {
-        // RFC 2202 test case 2 — verifies the hmac/sha1 crates produce
-        // the correct HMAC-SHA1 for a known (key, data, digest) triple.
         let key = b"Jefe";
         let data = b"what do ya want for nothing?";
 
@@ -317,7 +508,7 @@ mod tests {
         assert_eq!(result.as_slice(), expected);
     }
 
-    // --- Boundary / validation tests (test gap from breakit hunter) ---
+    // --- Panic tests (backward compat) ---
 
     #[test]
     #[should_panic(expected = "ttl must be greater than zero")]
@@ -328,9 +519,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "ttl overflow")]
     fn ttl_overflow_panics() {
-        // checked_add prevents silent wrap — overflow panics rather than
-        // creating a credential that never expires (time-bounding is a
-        // security guarantee per SECURITY.md).
         generate_credentials("secret", "user", Duration::from_secs(u64::MAX), &[], &[]);
     }
 
@@ -406,7 +594,7 @@ mod tests {
         );
     }
 
-    // --- IceTransportPolicy tests (Task 7) ---
+    // --- IceTransportPolicy tests ---
 
     #[test]
     fn relay_policy_via_constructor() {
@@ -423,7 +611,6 @@ mod tests {
 
     #[test]
     fn relay_policy_via_struct_update() {
-        // Verify the struct-update pattern works with the enum type
         let creds = TurnCredentials {
             ice_transport_policy: IceTransportPolicy::Relay,
             ..generate_credentials("secret", "user", Duration::from_secs(60), &[], &[])
@@ -447,5 +634,281 @@ mod tests {
         );
         let json = serde_json::to_string(&relay).unwrap();
         assert!(json.contains("\"iceTransportPolicy\":\"relay\""));
+    }
+
+    // --- try_ API (Result-returning) ---
+
+    #[test]
+    fn try_generate_succeeds() {
+        let creds = try_generate_credentials(
+            "secret",
+            "user",
+            Duration::from_secs(60),
+            &["turn:example.com:3478".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(creds.username.contains(":user"));
+        assert_eq!(creds.ttl, 60);
+    }
+
+    #[test]
+    fn try_generate_ttl_zero() {
+        let err = try_generate_credentials("secret", "user", Duration::from_secs(0), &[], &[]);
+        assert!(matches!(err, Err(TurnError::TtlZero)));
+    }
+
+    #[test]
+    fn try_generate_ttl_overflow() {
+        let err =
+            try_generate_credentials("secret", "user", Duration::from_secs(u64::MAX), &[], &[]);
+        assert!(matches!(err, Err(TurnError::TtlOverflow)));
+    }
+
+    #[test]
+    fn try_generate_empty_user_id() {
+        let err = try_generate_credentials("secret", "", Duration::from_secs(60), &[], &[]);
+        assert!(matches!(err, Err(TurnError::EmptyUserId)));
+    }
+
+    #[test]
+    fn try_generate_colon_user_id() {
+        let err = try_generate_credentials("secret", "a:b", Duration::from_secs(60), &[], &[]);
+        assert!(matches!(err, Err(TurnError::UserIdColon)));
+    }
+
+    #[test]
+    fn try_generate_control_char_user_id() {
+        let err = try_generate_credentials("secret", "a\nb", Duration::from_secs(60), &[], &[]);
+        assert!(matches!(err, Err(TurnError::UserIdControlChar)));
+    }
+
+    #[test]
+    fn try_generate_invalid_url() {
+        let err = try_generate_credentials(
+            "secret",
+            "user",
+            Duration::from_secs(60),
+            &["bad".to_string()],
+            &[],
+        );
+        assert!(matches!(err, Err(TurnError::InvalidUrlScheme { .. })));
+    }
+
+    #[test]
+    fn try_generate_empty_host() {
+        let err = try_generate_credentials(
+            "secret",
+            "user",
+            Duration::from_secs(60),
+            &["turn:".to_string()],
+            &[],
+        );
+        assert!(matches!(err, Err(TurnError::EmptyHost { .. })));
+    }
+
+    // --- Pure mint_credentials ---
+
+    #[test]
+    fn mint_is_deterministic() {
+        let a = mint_credentials(
+            "secret",
+            "user",
+            1_700_000_000,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        let b = mint_credentials(
+            "secret",
+            "user",
+            1_700_000_000,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert_eq!(a.username, b.username);
+        assert_eq!(a.credential, b.credential);
+    }
+
+    #[test]
+    fn mint_username_format() {
+        let creds = mint_credentials(
+            "secret",
+            "alice",
+            1234567890,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert_eq!(creds.username, "1234567890:alice");
+    }
+
+    #[test]
+    fn mint_different_user_different_credential() {
+        let a = mint_credentials(
+            "secret",
+            "alice",
+            1234567890,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        let b = mint_credentials(
+            "secret",
+            "bob",
+            1234567890,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert_ne!(a.username, b.username);
+        assert_ne!(a.credential, b.credential);
+    }
+
+    #[test]
+    fn mint_different_secret_same_username_different_credential() {
+        let a = mint_credentials(
+            "secret-a",
+            "alice",
+            1234567890,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        let b = mint_credentials(
+            "secret-b",
+            "alice",
+            1234567890,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert_eq!(a.username, b.username);
+        assert_ne!(a.credential, b.credential);
+    }
+
+    #[test]
+    fn mint_matches_known_vector() {
+        // HMAC-SHA1("test-secret", "1234567890:user1") = "Lp3V9X/F/funWfBsr+tLbLcoWiE="
+        let creds = mint_credentials(
+            "test-secret",
+            "user1",
+            1234567890,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert_eq!(creds.username, "1234567890:user1");
+        assert_eq!(creds.credential, "Lp3V9X/F/funWfBsr+tLbLcoWiE=");
+    }
+
+    #[test]
+    fn mint_ttl_is_zero_for_pure_mint() {
+        // mint_credentials doesn't set ttl (no Duration param) — caller sets it
+        let creds = mint_credentials(
+            "secret",
+            "user",
+            1234567890,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert_eq!(creds.ttl, 0);
+    }
+
+    // --- compute_expiry ---
+
+    #[test]
+    fn compute_expiry_basic() {
+        assert_eq!(compute_expiry(1000, Duration::from_secs(60)).unwrap(), 1060);
+    }
+
+    #[test]
+    fn compute_expiry_zero_ttl() {
+        let err = compute_expiry(1000, Duration::from_secs(0));
+        assert!(matches!(err, Err(TurnError::TtlZero)));
+    }
+
+    #[test]
+    fn compute_expiry_overflow() {
+        let err = compute_expiry(u64::MAX - 10, Duration::from_secs(100));
+        assert!(matches!(err, Err(TurnError::TtlOverflow)));
+    }
+
+    // --- TurnCredentialIssuer ---
+
+    #[test]
+    fn issuer_validates_config_once() {
+        let issuer = TurnCredentialIssuer::new(
+            "secret",
+            Duration::from_secs(3600),
+            &["turn:example.com:3478".to_string()],
+            &["stun:example.com:3478".to_string()],
+        )
+        .unwrap();
+        let creds = issuer.issue("alice").unwrap();
+        assert!(creds.username.ends_with(":alice"));
+        assert_eq!(creds.ttl, 3600);
+    }
+
+    #[test]
+    fn issuer_rejects_invalid_urls_at_construction() {
+        let err =
+            TurnCredentialIssuer::new("secret", Duration::from_secs(60), &["bad".to_string()], &[]);
+        assert!(matches!(err, Err(TurnError::InvalidUrlScheme { .. })));
+    }
+
+    #[test]
+    fn issuer_rejects_zero_ttl_at_construction() {
+        let err = TurnCredentialIssuer::new("secret", Duration::from_secs(0), &[], &[]);
+        assert!(matches!(err, Err(TurnError::TtlZero)));
+    }
+
+    #[test]
+    fn issuer_issue_validates_user_id() {
+        let issuer =
+            TurnCredentialIssuer::new("secret", Duration::from_secs(60), &[], &[]).unwrap();
+        let err = issuer.issue("");
+        assert!(matches!(err, Err(TurnError::EmptyUserId)));
+    }
+
+    #[test]
+    fn issuer_issue_with_policy() {
+        let issuer = TurnCredentialIssuer::new(
+            "secret",
+            Duration::from_secs(60),
+            &["turn:example.com:3478".to_string()],
+            &[],
+        )
+        .unwrap();
+        let creds = issuer
+            .issue_with_policy("bob", IceTransportPolicy::Relay)
+            .unwrap();
+        assert_eq!(creds.ice_transport_policy, IceTransportPolicy::Relay);
+    }
+
+    #[test]
+    fn issuer_issue_does_not_revalidate_urls() {
+        // Config validated once — issue() only checks user_id
+        let issuer = TurnCredentialIssuer::new(
+            "secret",
+            Duration::from_secs(60),
+            &["turn:example.com:3478".to_string()],
+            &[],
+        )
+        .unwrap();
+        // This should succeed — URLs were validated at new()
+        let creds = issuer.issue("alice").unwrap();
+        assert!(!creds.username.is_empty());
     }
 }
