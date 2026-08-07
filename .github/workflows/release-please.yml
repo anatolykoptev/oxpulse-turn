@@ -37,7 +37,7 @@ jobs:
       # App-opened PR does get them. permission-* narrows the minted token to
       # what release-please needs, instead of the whole installation grant.
       - name: Mint bot token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@v3
         id: bot-token
         with:
           app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
@@ -63,12 +63,12 @@ jobs:
       id-token: write   # OIDC for crates.io Trusted Publishing
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
 
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.1
 
       - name: Verify Cargo.toml version matches the tag
         env:
