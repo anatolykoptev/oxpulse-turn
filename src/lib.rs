@@ -163,6 +163,20 @@ impl TurnCredentialIssuer {
         if ttl.is_zero() {
             return Err(TurnError::TtlZero);
         }
+        if secret.len() < MIN_SECRET_LEN {
+            log::warn!(
+                "TURN secret is only {} bytes — recommend >= {} for HMAC-SHA1 security",
+                secret.len(),
+                MIN_SECRET_LEN
+            );
+        }
+        if ttl > MAX_TTL {
+            log::warn!(
+                "TURN TTL {:?} exceeds recommended max of {:?} — long-lived credentials weaken time-bounding",
+                ttl,
+                MAX_TTL
+            );
+        }
         Ok(Self {
             secret: secret.to_string(),
             ttl,
@@ -212,6 +226,52 @@ impl TurnCredentialIssuer {
 
 const TURN_SCHEMES: &[&str] = &["turn:", "turns:"];
 const STUN_SCHEMES: &[&str] = &["stun:", "stuns:"];
+
+/// Recommended maximum TTL for TURN credentials (1 hour).
+///
+/// Long-lived credentials increase the window for credential theft/replay.
+/// `oxpulse-chat` already reduced from 24h to 1h. This constant lets callers
+/// validate against the recommended upper bound.
+pub const MAX_TTL: Duration = Duration::from_secs(3600);
+
+/// Minimum recommended secret length for HMAC-SHA1 (16 bytes).
+///
+/// Shorter secrets weaken the HMAC — an attacker who brute-forces the secret
+/// can forge credentials. `TurnCredentialIssuer::new` warns on shorter secrets.
+pub const MIN_SECRET_LEN: usize = 16;
+
+/// Derive STUN URLs from TURN URLs by swapping the scheme.
+///
+/// `turn:example.com:3478?transport=udp` → `stun:example.com:3478`
+/// `turns:example.com:5349` → `stuns:example.com:5349`
+///
+/// Deduplicates and sorts the result. URLs with empty hosts are skipped.
+/// This eliminates the need to configure STUN separately when it's the same
+/// host as TURN (the common case).
+pub fn stun_urls_from_turn(turn_urls: &[String]) -> Vec<String> {
+    let mut urls: Vec<String> = turn_urls
+        .iter()
+        .filter_map(|url| {
+            // Find which TURN scheme this URL uses
+            let scheme = TURN_SCHEMES.iter().find(|s| url.starts_with(*s))?;
+            let rest = &url[scheme.len()..];
+            let authority = rest.split(['?', '#']).next()?;
+            if authority.is_empty() {
+                return None;
+            }
+            // Map turn: → stun:, turns: → stuns:
+            let stun_scheme = if *scheme == "turns:" {
+                "stuns:"
+            } else {
+                "stun:"
+            };
+            Some(format!("{stun_scheme}{authority}"))
+        })
+        .collect();
+    urls.sort();
+    urls.dedup();
+    urls
+}
 
 fn validate_user_id(user_id: &str) -> Result<(), TurnError> {
     if user_id.is_empty() {
@@ -910,5 +970,75 @@ mod tests {
         // This should succeed — URLs were validated at new()
         let creds = issuer.issue("alice").unwrap();
         assert!(!creds.username.is_empty());
+    }
+
+    // --- stun_urls_from_turn (#19) ---
+
+    #[test]
+    fn stun_urls_from_turn_basic() {
+        let turn = vec![
+            "turn:example.com:3478?transport=udp".to_string(),
+            "turn:example.com:3478?transport=tcp".to_string(),
+        ];
+        let stun = stun_urls_from_turn(&turn);
+        // Both produce stun:example.com:3478 — deduplicated
+        assert_eq!(stun, vec!["stun:example.com:3478"]);
+    }
+
+    #[test]
+    fn stun_urls_from_turns_scheme() {
+        let turn = vec!["turns:example.com:5349".to_string()];
+        let stun = stun_urls_from_turn(&turn);
+        assert_eq!(stun, vec!["stuns:example.com:5349"]);
+    }
+
+    #[test]
+    fn stun_urls_from_turn_sorted_dedup() {
+        let turn = vec![
+            "turn:b.com:3478".to_string(),
+            "turn:a.com:3478".to_string(),
+            "turn:a.com:3478".to_string(),
+        ];
+        let stun = stun_urls_from_turn(&turn);
+        assert_eq!(stun, vec!["stun:a.com:3478", "stun:b.com:3478"]);
+    }
+
+    #[test]
+    fn stun_urls_from_turn_empty_input() {
+        assert!(stun_urls_from_turn(&[]).is_empty());
+    }
+
+    #[test]
+    fn stun_urls_from_turn_skips_empty_host() {
+        let turn = vec!["turn:".to_string(), "turn:example.com:3478".to_string()];
+        let stun = stun_urls_from_turn(&turn);
+        assert_eq!(stun, vec!["stun:example.com:3478"]);
+    }
+
+    // --- MAX_TTL + MIN_SECRET_LEN constants (#20, #21) ---
+
+    #[test]
+    fn max_ttl_is_one_hour() {
+        assert_eq!(MAX_TTL, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn min_secret_len_is_16() {
+        assert_eq!(MIN_SECRET_LEN, 16);
+    }
+
+    #[test]
+    fn issuer_accepts_short_secret_with_warn() {
+        // Short secret doesn't fail — just warns (backward compat)
+        let issuer = TurnCredentialIssuer::new("short", Duration::from_secs(60), &[], &[]);
+        assert!(issuer.is_ok());
+    }
+
+    #[test]
+    fn issuer_accepts_long_ttl_with_warn() {
+        // TTL > MAX_TTL doesn't fail — just warns (backward compat)
+        let issuer =
+            TurnCredentialIssuer::new("long-enough-secret", Duration::from_secs(7200), &[], &[]);
+        assert!(issuer.is_ok());
     }
 }
