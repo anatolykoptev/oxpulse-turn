@@ -1,0 +1,6 @@
+# Build artifacts. Absent until now because the monorepo's root .gitignore
+# covered this directory; the extraction left the crate without one.
+/target
+
+# Cargo.lock IS committed on purpose: preflight runs `cargo build --locked`,
+# which fails without it.

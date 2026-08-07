@@ -7,6 +7,7 @@ publish = true
 license = "AGPL-3.0-or-later"
 description = "TURN/STUN credential generation (coturn REST API compatible HMAC-SHA1) for WebRTC ICE negotiation"
 homepage = "https://oxpulse.chat"
+repository = "https://github.com/anatolykoptev/oxpulse-turn"
 readme = "README.md"
 keywords = ["turn", "stun", "webrtc", "ice", "coturn"]
 categories = ["network-programming", "cryptography"]
