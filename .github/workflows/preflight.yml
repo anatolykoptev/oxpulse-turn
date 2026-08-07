@@ -1,0 +1,46 @@
+name: preflight
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: clippy + tests
+    # Public repo: GitHub-hosted arm64 is free and unlimited, and arm64 matches
+    # where this crate actually runs in production.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Deliberately `cargo test`, not cargo-nextest. nextest is not present on
+      # the hosted arm64 image, so using it would mean a step that fetches its
+      # own tool — a host dependency in disguise, and the arch-specific kind
+      # that has bitten this fleet before. This crate has four tests and one
+      # doctest; `cargo test` covers both in one command and adds no dependency.
+      - name: Tests (unit + doc)
+        run: cargo test --all-features
+
+      - name: Build with locked dependencies
+        run: cargo build --locked --release
