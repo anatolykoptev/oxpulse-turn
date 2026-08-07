@@ -1,0 +1,3 @@
+# HMAC-SHA1 test vector — not a secret, computed from
+# HMAC-SHA1("test-secret", "1234567890:user1") via Python hashlib
+src/lib.rs:generic-api-key:285
