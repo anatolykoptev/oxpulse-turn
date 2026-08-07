@@ -32,11 +32,24 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
     steps:
+      # A release PR opened with GITHUB_TOKEN receives NO CI runs, so its
+      # required check can never pass and the PR cannot be merged. An
+      # App-opened PR does get them. permission-* narrows the minted token to
+      # what release-please needs, instead of the whole installation grant.
+      - name: Mint bot token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: bot-token
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Run release-please
         uses: googleapis/release-please-action@v5.0.0
         id: release
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.bot-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
