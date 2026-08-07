@@ -65,6 +65,8 @@ pub enum TurnError {
     UserIdColon,
     #[error("user_id must not contain control characters")]
     UserIdControlChar,
+    #[error("user_id must not exceed {0} chars")]
+    UserIdTooLong(usize),
     #[error("URL must start with one of {expected:?}: got {url:?}")]
     InvalidUrlScheme {
         expected: &'static [&'static str],
@@ -80,6 +82,7 @@ pub enum TurnError {
 ///
 /// `"all"` allows all candidates (host, server-reflexive, relay);
 /// `"relay"` forces TURN relay only, hiding client IPs from peers.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IceTransportPolicy {
@@ -91,6 +94,7 @@ pub enum IceTransportPolicy {
 }
 
 /// TURN/STUN server entry for ICE negotiation.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct IceServer {
     pub urls: Vec<String>,
@@ -101,6 +105,7 @@ pub struct IceServer {
 }
 
 /// Temporary TURN credentials (coturn REST API compatible).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct TurnCredentials {
     pub username: String,
@@ -113,6 +118,11 @@ pub struct TurnCredentials {
     /// IPs from peers.
     #[serde(rename = "iceTransportPolicy")]
     pub ice_transport_policy: IceTransportPolicy,
+    /// Human-readable expiry timestamp (RFC 3339). Only present when the
+    /// `chrono` feature is enabled.
+    #[cfg(feature = "chrono")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Pre-validated TURN credential issuer for server use cases.
@@ -120,6 +130,11 @@ pub struct TurnCredentials {
 /// Validates configuration (secret, URLs, TTL) **once** at construction,
 /// then mints credentials per-request without repeating validation. This is
 /// the recommended API for servers that mint credentials on a hot path.
+///
+/// Supports rolling key rotation: [`TurnCredentialIssuer::new_multi`] accepts
+/// multiple secrets (active + alternates). [`TurnCredentialIssuer::rotate`]
+/// inserts a new active secret; [`TurnCredentialIssuer::drop_oldest`] removes
+/// the oldest after the rotation window expires.
 ///
 /// # Example
 ///
@@ -140,14 +155,15 @@ pub struct TurnCredentials {
 /// ```
 #[derive(Debug, Clone)]
 pub struct TurnCredentialIssuer {
-    secret: String,
+    /// `[0]` = active (mint), `[1..]` = alternates (accepted by coturn during rotation overlap).
+    secrets: Vec<String>,
     ttl: Duration,
     turn_urls: Vec<String>,
     stun_urls: Vec<String>,
 }
 
 impl TurnCredentialIssuer {
-    /// Create a new issuer, validating configuration once.
+    /// Create a new issuer with a single secret, validating configuration once.
     ///
     /// # Errors
     ///
@@ -158,17 +174,40 @@ impl TurnCredentialIssuer {
         turn_urls: &[String],
         stun_urls: &[String],
     ) -> Result<Self, TurnError> {
+        Self::new_multi(vec![secret.to_string()], ttl, turn_urls, stun_urls)
+    }
+
+    /// Create a new issuer with multiple secrets for rolling rotation.
+    ///
+    /// `secrets[0]` is the active secret (used for minting). `secrets[1..]`
+    /// are alternates — coturn accepts credentials minted with any of them
+    /// during the rotation overlap window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError`] if `secrets` is empty, URLs are invalid, or TTL is zero.
+    pub fn new_multi(
+        secrets: Vec<String>,
+        ttl: Duration,
+        turn_urls: &[String],
+        stun_urls: &[String],
+    ) -> Result<Self, TurnError> {
+        if secrets.is_empty() {
+            return Err(TurnError::EmptyUserId);
+        }
         validate_urls(turn_urls, TURN_SCHEMES)?;
         validate_urls(stun_urls, STUN_SCHEMES)?;
         if ttl.is_zero() {
             return Err(TurnError::TtlZero);
         }
-        if secret.len() < MIN_SECRET_LEN {
-            log::warn!(
-                "TURN secret is only {} bytes — recommend >= {} for HMAC-SHA1 security",
-                secret.len(),
-                MIN_SECRET_LEN
-            );
+        for secret in &secrets {
+            if secret.len() < MIN_SECRET_LEN {
+                log::warn!(
+                    "TURN secret is only {} bytes — recommend >= {} for HMAC-SHA1 security",
+                    secret.len(),
+                    MIN_SECRET_LEN
+                );
+            }
         }
         if ttl > MAX_TTL {
             log::warn!(
@@ -178,7 +217,7 @@ impl TurnCredentialIssuer {
             );
         }
         Ok(Self {
-            secret: secret.to_string(),
+            secrets,
             ttl,
             turn_urls: turn_urls.to_vec(),
             stun_urls: stun_urls.to_vec(),
@@ -212,7 +251,7 @@ impl TurnCredentialIssuer {
         let now = now_unix()?;
         let expiry = compute_expiry(now, self.ttl)?;
         let mut creds = mint_credentials(
-            &self.secret,
+            &self.secrets[0],
             user_id,
             expiry,
             &self.turn_urls,
@@ -221,6 +260,30 @@ impl TurnCredentialIssuer {
         )?;
         creds.ttl = self.ttl.as_secs();
         Ok(creds)
+    }
+
+    /// Rotate: insert a new active secret, pushing the current one to alternate.
+    ///
+    /// After rotation, `secrets[0]` is the new active (mint), `secrets[1]` is
+    /// the previous active (still accepted by coturn during overlap).
+    pub fn rotate(&mut self, new_secret: String) {
+        self.secrets.insert(0, new_secret);
+    }
+
+    /// Drop the oldest secret after the rotation window expires.
+    ///
+    /// Keeps at least one secret (the active). Call this after all credentials
+    /// minted with the old secret have expired.
+    pub fn drop_oldest(&mut self) {
+        if self.secrets.len() > 1 {
+            self.secrets.pop();
+        }
+    }
+
+    /// Number of secrets currently held (active + alternates).
+    #[must_use]
+    pub fn secret_count(&self) -> usize {
+        self.secrets.len()
     }
 }
 
@@ -239,6 +302,13 @@ pub const MAX_TTL: Duration = Duration::from_secs(3600);
 /// Shorter secrets weaken the HMAC — an attacker who brute-forces the secret
 /// can forge credentials. `TurnCredentialIssuer::new` warns on shorter secrets.
 pub const MIN_SECRET_LEN: usize = 16;
+
+/// Maximum allowed `user_id` length (384 chars).
+///
+/// Generous: UUID is 36, email ~50, opaque ID ~64. A pathologically long
+/// `user_id` bloats the username/credential and coturn's parsing. Reference:
+/// flow-turn's 384-char limit.
+pub const MAX_USER_ID_LEN: usize = 384;
 
 /// Derive STUN URLs from TURN URLs by swapping the scheme.
 ///
@@ -276,6 +346,9 @@ pub fn stun_urls_from_turn(turn_urls: &[String]) -> Vec<String> {
 fn validate_user_id(user_id: &str) -> Result<(), TurnError> {
     if user_id.is_empty() {
         return Err(TurnError::EmptyUserId);
+    }
+    if user_id.len() > MAX_USER_ID_LEN {
+        return Err(TurnError::UserIdTooLong(MAX_USER_ID_LEN));
     }
     if user_id.contains(':') {
         return Err(TurnError::UserIdColon);
@@ -382,6 +455,8 @@ pub fn mint_credentials(
         ttl: 0,
         ice_servers,
         ice_transport_policy: policy,
+        #[cfg(feature = "chrono")]
+        expires_at: chrono::DateTime::from_timestamp(expiry_unix as i64, 0),
     })
 }
 
@@ -1040,5 +1115,111 @@ mod tests {
         let issuer =
             TurnCredentialIssuer::new("long-enough-secret", Duration::from_secs(7200), &[], &[]);
         assert!(issuer.is_ok());
+    }
+
+    // --- user_id length limit (#24) ---
+
+    #[test]
+    fn max_user_id_len_is_384() {
+        assert_eq!(MAX_USER_ID_LEN, 384);
+    }
+
+    #[test]
+    fn try_generate_user_id_too_long() {
+        let long_id = "a".repeat(MAX_USER_ID_LEN + 1);
+        let err = try_generate_credentials("secret", &long_id, Duration::from_secs(60), &[], &[]);
+        assert!(matches!(err, Err(TurnError::UserIdTooLong(384))));
+    }
+
+    #[test]
+    fn try_generate_user_id_exactly_at_limit() {
+        let id = "a".repeat(MAX_USER_ID_LEN);
+        let result = try_generate_credentials("secret", &id, Duration::from_secs(60), &[], &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "user_id must not exceed")]
+    fn long_user_id_panics() {
+        let long_id = "a".repeat(MAX_USER_ID_LEN + 1);
+        generate_credentials("secret", &long_id, Duration::from_secs(60), &[], &[]);
+    }
+
+    // --- Multi-secret rotation (#25) ---
+
+    #[test]
+    fn new_multi_creates_issuer_with_multiple_secrets() {
+        let issuer = TurnCredentialIssuer::new_multi(
+            vec![
+                "active-secret-12345".to_string(),
+                "old-secret-123456".to_string(),
+            ],
+            Duration::from_secs(60),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(issuer.secret_count(), 2);
+    }
+
+    #[test]
+    fn new_multi_rejects_empty_secrets() {
+        let err = TurnCredentialIssuer::new_multi(vec![], Duration::from_secs(60), &[], &[]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn rotate_inserts_new_active_secret() {
+        let mut issuer =
+            TurnCredentialIssuer::new("first-secret-12345", Duration::from_secs(60), &[], &[])
+                .unwrap();
+        assert_eq!(issuer.secret_count(), 1);
+
+        issuer.rotate("second-secret-1234".to_string());
+        assert_eq!(issuer.secret_count(), 2);
+    }
+
+    #[test]
+    fn drop_oldest_removes_old_secret() {
+        let mut issuer = TurnCredentialIssuer::new_multi(
+            vec![
+                "active-secret-12345".to_string(),
+                "old-secret-123456".to_string(),
+            ],
+            Duration::from_secs(60),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(issuer.secret_count(), 2);
+
+        issuer.drop_oldest();
+        assert_eq!(issuer.secret_count(), 1);
+    }
+
+    #[test]
+    fn drop_oldest_keeps_at_least_one() {
+        let mut issuer =
+            TurnCredentialIssuer::new("only-secret-12345", Duration::from_secs(60), &[], &[])
+                .unwrap();
+        assert_eq!(issuer.secret_count(), 1);
+
+        issuer.drop_oldest();
+        assert_eq!(issuer.secret_count(), 1);
+    }
+
+    #[test]
+    fn rotation_mints_with_new_active_secret() {
+        let mut issuer =
+            TurnCredentialIssuer::new("first-secret-12345", Duration::from_secs(60), &[], &[])
+                .unwrap();
+        let creds_before = issuer.issue("alice").unwrap();
+
+        issuer.rotate("second-secret-1234".to_string());
+        let creds_after = issuer.issue("alice").unwrap();
+
+        // Same user, same time window → username may match, but credential
+        // differs because the active secret changed
+        assert_ne!(creds_before.credential, creds_after.credential);
     }
 }
