@@ -1,6 +1,6 @@
 [package]
 name = "oxpulse-turn"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.70"
 publish = true
@@ -17,6 +17,7 @@ base64 = "0.22"
 hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
+thiserror = "1"
 
 [dev-dependencies]
 serde_json = "1"
