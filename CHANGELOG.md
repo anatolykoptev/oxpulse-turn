@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/anatolykoptev/oxpulse-turn/compare/v0.2.0...v0.2.1) (2026-08-07)
+
+
+### Bug Fixes
+
+* bug-hunt findings + consumer feedback (closes [#30](https://github.com/anatolykoptev/oxpulse-turn/issues/30)-[#36](https://github.com/anatolykoptev/oxpulse-turn/issues/36)) ([#37](https://github.com/anatolykoptev/oxpulse-turn/issues/37)) ([2670ced](https://github.com/anatolykoptev/oxpulse-turn/commit/2670ced413b89b23f8d2a4040378cde94b6c91e4))
+
 ## [0.2.0](https://github.com/anatolykoptev/oxpulse-turn/compare/v0.1.2...v0.2.0) (2026-08-07)
 
 
