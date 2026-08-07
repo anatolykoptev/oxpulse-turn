@@ -20,9 +20,19 @@ format coturn's `--use-auth-secret` validates.
 - Builds a ready-to-serialize `iceServers` array (STUN + TURN) for an
   `RTCPeerConnection` config — `serde::Serialize`, camelCase-correct.
 - `iceTransportPolicy` control via `IceTransportPolicy` enum (`All` vs `Relay`)
-  to optionally force relay and hide client IPs.
+  to optionally force relay and hide client IPs. Parse from a string with
+  `FromStr` and convert back with `as_str()` — no hand-rolled `match` with a
+  silent `_ => All` default (that would leak client IPs on unknown input).
 - Input validation: rejects empty `user_id`, `:` in `user_id`, control
   characters, invalid URL schemes, and zero TTL.
+- `TurnCredentialIssuer` for server use: validate config once at startup,
+  `.issue()` per request. Supports rolling key rotation (`new_multi`, `rotate`,
+  `drop_oldest`) and a strict mode that rejects short secrets / long TTLs
+  (`new_strict`, `new_multi_strict`).
+- `stun_urls_from_turn` helper: derive STUN URLs from your TURN pool by
+  swapping the scheme — no need to configure STUN separately when it's the same
+  host (the common case).
+- Secrets are zeroized from memory on drop (`zeroize` crate).
 - Pure function: no async, no I/O, no TURN-server dependency, zero server state.
 
 ## Install
@@ -30,6 +40,18 @@ format coturn's `--use-auth-secret` validates.
 ```toml
 [dependencies]
 oxpulse-turn = "0.2"
+```
+
+### Feature flags
+
+| Feature | Default | What it enables |
+|---|---|---|
+| `chrono` | off | `expires_at: Option<chrono::DateTime<Utc>>` field on `TurnCredentials` (RFC 3339 timestamp). Without it, only the numeric expiry in `username` is available. |
+| `openapi` | off | `utoipa::ToSchema` derives on `TurnCredentials`, `IceServer`, `IceTransportPolicy` — for embedding in an OpenAPI document. |
+
+```toml
+# Enable both:
+oxpulse-turn = { version = "0.2", features = ["chrono", "openapi"] }
 ```
 
 ## Usage
@@ -77,6 +99,37 @@ let creds = generate_credentials_with_policy(
     IceTransportPolicy::Relay,
 );
 ```
+
+## Migrating from 0.1.x
+
+The only breaking change in 0.2.0 is the `ice_transport_policy` field type:
+`&'static str` → `IceTransportPolicy` enum. The serde JSON output is unchanged
+(`"all"`/`"relay"`), so the wire format is identical.
+
+If your decision function returns `&str` (e.g. because the same value feeds a
+Prometheus label), bridge at the single construction site instead of converting
+your whole call chain:
+
+```rust
+use std::str::FromStr;
+use oxpulse_turn::IceTransportPolicy;
+
+// Your existing function returns &str — keep it.
+fn decide_policy(user: &User) -> &'static str { /* ... */ "relay" }
+
+// Bridge at the call site — FromStr forces you to handle the unknown case.
+let policy = IceTransportPolicy::from_str(decide_policy(&user))?;
+```
+
+**Do not** hand-roll `match s { "relay" => Relay, _ => All }` — the `_ => All`
+arm is a **security** default, not a cosmetic one. `All` exposes the client's IP
+to the peer; `Relay` hides it. A typo or a future third variant silently
+becomes `All` and de-anonymises a user with no error and no log. `FromStr`
+returns `TurnError::UnknownIceTransportPolicy` on unknown input, forcing you to
+handle it.
+
+For the reverse direction (enum → `&str` for a metrics label), use
+`IceTransportPolicy::as_str()`.
 
 ## Validation
 

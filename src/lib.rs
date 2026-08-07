@@ -19,6 +19,7 @@
 //! | Layer | Function | When to use |
 //! |---|---|---|
 //! | **Issuer** | [`TurnCredentialIssuer`] | Server: validate config once at startup, `.issue()` per request |
+//! | **Issuer (strict)** | [`TurnCredentialIssuer::new_strict`] | Same, but rejects short secrets / long TTLs instead of warning |
 //! | **Pure mint** | [`mint_credentials`] + [`compute_expiry`] | Deterministic minting with caller-supplied expiry (testable, no `SystemTime`) |
 //! | **Try** | [`try_generate_credentials`] | One-shot mint returning `Result` (no panic) |
 //! | **Panic** | [`generate_credentials`] | Simple use cases (panics on invalid input) |
@@ -49,11 +50,16 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::Serialize;
 use sha1::Sha1;
+use zeroize::Zeroizing;
 
 type HmacSha1 = Hmac<Sha1>;
 
 /// Errors that can occur during TURN credential generation.
+///
+/// `#[non_exhaustive]` — new variants may be added in minor releases without a
+/// breaking change. Callers should not match exhaustively without a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TurnError {
     #[error("ttl must be greater than zero")]
     TtlZero,
@@ -76,12 +82,27 @@ pub enum TurnError {
     EmptyHost { url: String },
     #[error("system clock before unix epoch")]
     ClockBeforeEpoch,
+    #[error("secrets must be non-empty")]
+    EmptySecrets,
+    #[error("secret must be at least {0} bytes for HMAC-SHA1 security")]
+    SecretTooShort(usize),
+    #[error("ttl {0:?} exceeds recommended max of {MAX_TTL:?} — long-lived credentials weaken time-bounding")]
+    TtlTooLong(Duration),
+    #[error("expiry {0} is out of range for chrono::DateTime conversion")]
+    ExpiryOutOfRange(u64),
+    #[error("unknown ice transport policy: {0:?} (expected \"all\" or \"relay\")")]
+    UnknownIceTransportPolicy(String),
 }
 
 /// ICE transport policy for WebRTC `RTCPeerConnection`.
 ///
 /// `"all"` allows all candidates (host, server-reflexive, relay);
 /// `"relay"` forces TURN relay only, hiding client IPs from peers.
+///
+/// Convert from a string with [`FromStr`][std::str::FromStr] and back with
+/// [`as_str`]. **Do not** hand-roll a `match` with a `_ => All` default —
+/// `All` exposes the client's IP to the peer, so a silent fallback is a
+/// security downgrade, not a cosmetic one.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -91,6 +112,37 @@ pub enum IceTransportPolicy {
     All,
     /// Force TURN relay only — hides client IPs from peers.
     Relay,
+}
+
+impl IceTransportPolicy {
+    /// Return the wire string (`"all"` or `"relay"`) for this policy.
+    ///
+    /// Useful for feeding a metrics label or log field without going through
+    /// `serde_json::to_string` and trimming quotes.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Relay => "relay",
+        }
+    }
+}
+
+impl std::str::FromStr for IceTransportPolicy {
+    type Err = TurnError;
+
+    /// Parse `"all"` or `"relay"` (case-sensitive) into [`IceTransportPolicy`].
+    ///
+    /// Returns [`TurnError::UnknownIceTransportPolicy`] for any other string.
+    /// This forces the caller to handle the unknown case explicitly instead of
+    /// silently defaulting to `All` (which would expose client IPs).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(Self::All),
+            "relay" => Ok(Self::Relay),
+            other => Err(TurnError::UnknownIceTransportPolicy(other.to_string())),
+        }
+    }
 }
 
 /// TURN/STUN server entry for ICE negotiation.
@@ -136,6 +188,13 @@ pub struct TurnCredentials {
 /// inserts a new active secret; [`TurnCredentialIssuer::drop_oldest`] removes
 /// the oldest after the rotation window expires.
 ///
+/// **Strict mode:** [`new_strict`] / [`new_multi_strict`] reject short secrets
+/// (< [`MIN_SECRET_LEN`]) and long TTLs (> [`MAX_TTL`]) with errors instead of
+/// log warnings. Use these in security-conscious deployments.
+///
+/// **Secret hygiene:** secrets are stored as [`Zeroizing<String>`] and
+/// overwritten on drop — see the `zeroize` crate.
+///
 /// # Example
 ///
 /// ```
@@ -156,7 +215,8 @@ pub struct TurnCredentials {
 #[derive(Debug, Clone)]
 pub struct TurnCredentialIssuer {
     /// `[0]` = active (mint), `[1..]` = alternates (accepted by coturn during rotation overlap).
-    secrets: Vec<String>,
+    /// Wrapped in [`Zeroizing`] so secret bytes are overwritten on drop.
+    secrets: Vec<Zeroizing<String>>,
     ttl: Duration,
     turn_urls: Vec<String>,
     stun_urls: Vec<String>,
@@ -164,6 +224,9 @@ pub struct TurnCredentialIssuer {
 
 impl TurnCredentialIssuer {
     /// Create a new issuer with a single secret, validating configuration once.
+    ///
+    /// Short secrets (< [`MIN_SECRET_LEN`]) and long TTLs (> [`MAX_TTL`]) are
+    /// accepted with a log warning. Use [`new_strict`] to reject them.
     ///
     /// # Errors
     ///
@@ -183,6 +246,9 @@ impl TurnCredentialIssuer {
     /// are alternates — coturn accepts credentials minted with any of them
     /// during the rotation overlap window.
     ///
+    /// Short secrets (< [`MIN_SECRET_LEN`]) and long TTLs (> [`MAX_TTL`]) are
+    /// accepted with a log warning. Use [`new_multi_strict`] to reject them.
+    ///
     /// # Errors
     ///
     /// Returns [`TurnError`] if `secrets` is empty, URLs are invalid, or TTL is zero.
@@ -192,8 +258,52 @@ impl TurnCredentialIssuer {
         turn_urls: &[String],
         stun_urls: &[String],
     ) -> Result<Self, TurnError> {
+        Self::build(secrets, ttl, turn_urls, stun_urls, false)
+    }
+
+    /// Like [`new`] but rejects short secrets (< [`MIN_SECRET_LEN`]) and long
+    /// TTLs (> [`MAX_TTL`]) with [`TurnError::SecretTooShort`] /
+    /// [`TurnError::TtlTooLong`] instead of warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError`] if the secret is too short, TTL is too long,
+    /// URLs are invalid, or TTL is zero.
+    pub fn new_strict(
+        secret: &str,
+        ttl: Duration,
+        turn_urls: &[String],
+        stun_urls: &[String],
+    ) -> Result<Self, TurnError> {
+        Self::new_multi_strict(vec![secret.to_string()], ttl, turn_urls, stun_urls)
+    }
+
+    /// Like [`new_multi`] but rejects short secrets and long TTLs instead of
+    /// warning. See [`new_strict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnError`] if any secret is too short, TTL is too long,
+    /// `secrets` is empty, URLs are invalid, or TTL is zero.
+    pub fn new_multi_strict(
+        secrets: Vec<String>,
+        ttl: Duration,
+        turn_urls: &[String],
+        stun_urls: &[String],
+    ) -> Result<Self, TurnError> {
+        Self::build(secrets, ttl, turn_urls, stun_urls, true)
+    }
+
+    /// Shared constructor core for both lenient and strict modes.
+    fn build(
+        secrets: Vec<String>,
+        ttl: Duration,
+        turn_urls: &[String],
+        stun_urls: &[String],
+        strict: bool,
+    ) -> Result<Self, TurnError> {
         if secrets.is_empty() {
-            return Err(TurnError::EmptyUserId);
+            return Err(TurnError::EmptySecrets);
         }
         validate_urls(turn_urls, TURN_SCHEMES)?;
         validate_urls(stun_urls, STUN_SCHEMES)?;
@@ -202,6 +312,9 @@ impl TurnCredentialIssuer {
         }
         for secret in &secrets {
             if secret.len() < MIN_SECRET_LEN {
+                if strict {
+                    return Err(TurnError::SecretTooShort(MIN_SECRET_LEN));
+                }
                 log::warn!(
                     "TURN secret is only {} bytes — recommend >= {} for HMAC-SHA1 security",
                     secret.len(),
@@ -210,6 +323,9 @@ impl TurnCredentialIssuer {
             }
         }
         if ttl > MAX_TTL {
+            if strict {
+                return Err(TurnError::TtlTooLong(ttl));
+            }
             log::warn!(
                 "TURN TTL {:?} exceeds recommended max of {:?} — long-lived credentials weaken time-bounding",
                 ttl,
@@ -217,7 +333,7 @@ impl TurnCredentialIssuer {
             );
         }
         Ok(Self {
-            secrets,
+            secrets: secrets.into_iter().map(Zeroizing::new).collect(),
             ttl,
             turn_urls: turn_urls.to_vec(),
             stun_urls: stun_urls.to_vec(),
@@ -258,6 +374,7 @@ impl TurnCredentialIssuer {
             &self.stun_urls,
             policy,
         )?;
+        // Zeroizing<String> derefs to String → &str, so &self.secrets[0] works.
         creds.ttl = self.ttl.as_secs();
         Ok(creds)
     }
@@ -267,7 +384,7 @@ impl TurnCredentialIssuer {
     /// After rotation, `secrets[0]` is the new active (mint), `secrets[1]` is
     /// the previous active (still accepted by coturn during overlap).
     pub fn rotate(&mut self, new_secret: String) {
-        self.secrets.insert(0, new_secret);
+        self.secrets.insert(0, Zeroizing::new(new_secret));
     }
 
     /// Drop the oldest secret after the rotation window expires.
@@ -456,7 +573,9 @@ pub fn mint_credentials(
         ice_servers,
         ice_transport_policy: policy,
         #[cfg(feature = "chrono")]
-        expires_at: chrono::DateTime::from_timestamp(expiry_unix as i64, 0),
+        expires_at: i64::try_from(expiry_unix)
+            .ok()
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)),
     })
 }
 
@@ -1165,7 +1284,7 @@ mod tests {
     #[test]
     fn new_multi_rejects_empty_secrets() {
         let err = TurnCredentialIssuer::new_multi(vec![], Duration::from_secs(60), &[], &[]);
-        assert!(err.is_err());
+        assert!(matches!(err, Err(TurnError::EmptySecrets)));
     }
 
     #[test]
@@ -1221,5 +1340,152 @@ mod tests {
         // Same user, same time window → username may match, but credential
         // differs because the active secret changed
         assert_ne!(creds_before.credential, creds_after.credential);
+    }
+
+    // --- Strict mode (#33, #34) ---
+
+    #[test]
+    fn strict_rejects_short_secret() {
+        let err = TurnCredentialIssuer::new_strict("short", Duration::from_secs(60), &[], &[]);
+        assert!(matches!(
+            err,
+            Err(TurnError::SecretTooShort(MIN_SECRET_LEN))
+        ));
+    }
+
+    #[test]
+    fn strict_accepts_long_enough_secret() {
+        let issuer = TurnCredentialIssuer::new_strict(
+            "long-enough-secret",
+            Duration::from_secs(60),
+            &[],
+            &[],
+        );
+        assert!(issuer.is_ok());
+    }
+
+    #[test]
+    fn strict_rejects_long_ttl() {
+        let err = TurnCredentialIssuer::new_strict(
+            "long-enough-secret",
+            Duration::from_secs(7200),
+            &[],
+            &[],
+        );
+        assert!(matches!(err, Err(TurnError::TtlTooLong(_))));
+    }
+
+    #[test]
+    fn strict_accepts_max_ttl() {
+        let issuer = TurnCredentialIssuer::new_strict("long-enough-secret", MAX_TTL, &[], &[]);
+        assert!(issuer.is_ok());
+    }
+
+    #[test]
+    fn strict_multi_rejects_any_short_secret() {
+        let err = TurnCredentialIssuer::new_multi_strict(
+            vec!["long-enough-secret".to_string(), "short".to_string()],
+            Duration::from_secs(60),
+            &[],
+            &[],
+        );
+        assert!(matches!(err, Err(TurnError::SecretTooShort(_))));
+    }
+
+    #[test]
+    fn lenient_still_accepts_short_secret_and_long_ttl() {
+        // Backward compat: new() still warns instead of rejecting
+        let issuer = TurnCredentialIssuer::new("short", Duration::from_secs(7200), &[], &[]);
+        assert!(issuer.is_ok());
+    }
+
+    // --- IceTransportPolicy FromStr + as_str (#30) ---
+
+    #[test]
+    fn policy_from_str_all() {
+        let policy: IceTransportPolicy = "all".parse().unwrap();
+        assert_eq!(policy, IceTransportPolicy::All);
+    }
+
+    #[test]
+    fn policy_from_str_relay() {
+        let policy: IceTransportPolicy = "relay".parse().unwrap();
+        assert_eq!(policy, IceTransportPolicy::Relay);
+    }
+
+    #[test]
+    fn policy_from_str_unknown_rejects() {
+        let err: Result<IceTransportPolicy, _> = "unknown".parse();
+        assert!(matches!(err, Err(TurnError::UnknownIceTransportPolicy(_))));
+    }
+
+    #[test]
+    fn policy_from_str_case_sensitive() {
+        let err: Result<IceTransportPolicy, _> = "All".parse();
+        assert!(err.is_err(), "from_str should be case-sensitive");
+    }
+
+    #[test]
+    fn policy_as_str_roundtrip() {
+        for policy in [IceTransportPolicy::All, IceTransportPolicy::Relay] {
+            let s = policy.as_str();
+            let back: IceTransportPolicy = s.parse().unwrap();
+            assert_eq!(policy, back, "as_str → from_str roundtrip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn policy_as_str_matches_serde_output() {
+        let all = generate_credentials("secret", "user", Duration::from_secs(60), &[], &[]);
+        assert_eq!(all.ice_transport_policy.as_str(), "all");
+
+        let relay = generate_credentials_with_policy(
+            "secret",
+            "user",
+            Duration::from_secs(60),
+            &[],
+            &[],
+            IceTransportPolicy::Relay,
+        );
+        assert_eq!(relay.ice_transport_policy.as_str(), "relay");
+    }
+
+    // --- chrono overflow (#35) ---
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn chrono_expires_at_none_on_overflow() {
+        // u64::MAX cannot be converted to i64 — expires_at should be None
+        // rather than silently wrapping to a negative timestamp.
+        let creds = mint_credentials(
+            "secret",
+            "user",
+            u64::MAX,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert!(
+            creds.expires_at.is_none(),
+            "expires_at should be None for u64::MAX"
+        );
+        // username and credential are still valid
+        assert!(creds.username.contains("18446744073709551615"));
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn chrono_expires_at_some_for_normal_value() {
+        let creds = mint_credentials(
+            "secret",
+            "user",
+            1_700_000_000,
+            &[],
+            &[],
+            IceTransportPolicy::All,
+        )
+        .unwrap();
+        assert!(creds.expires_at.is_some());
     }
 }
