@@ -1,8 +1,8 @@
 # oxpulse-turn
 
 [![crates.io](https://img.shields.io/crates/v/oxpulse-turn.svg)](https://crates.io/crates/oxpulse-turn)
-|[![docs.rs](https://img.shields.io/docsrs/oxpulse-turn)](https://docs.rs/oxpulse-turn)
-|[![license: AGPL-3.0-or-later](https://img.shields.io/crates/l/oxpulse-turn.svg)](#license)
+[![docs.rs](https://img.shields.io/docsrs/oxpulse-turn)](https://docs.rs/oxpulse-turn)
+[![license: AGPL-3.0-or-later](https://img.shields.io/crates/l/oxpulse-turn.svg)](#license)
 
 Short-lived **TURN/STUN credentials** for WebRTC ICE, compatible with the
 [coturn](https://github.com/coturn/coturn) REST-API time-limited credential

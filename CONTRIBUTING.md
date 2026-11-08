@@ -19,19 +19,22 @@ selection, relay health, and anything that reaches the network belong elsewhere.
 ## Development
 
 ```sh
-cargo test                    # unit tests + doctests
-cargo clippy -- -D warnings   # the CI gate; warnings are errors
-cargo fmt
+cargo test --all-features                                    # unit tests + doctests
+cargo clippy --all-targets --all-features -- -D warnings     # warnings are errors
+cargo fmt --all -- --check
+cargo build --locked --release
 ```
 
-CI runs exactly `cargo clippy -- -D warnings` and `cargo test` on
-`ubuntu-24.04-arm`. If those pass locally they will pass there.
+CI runs exactly these four commands (job `clippy + tests`) on `ubuntu-24.04-arm`.
+If they pass locally they will pass there. A pull request that changes only
+documents skips that job.
 
 ## Commits
 
 Conventional commits — `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`. The
 release pipeline reads them: `feat:` produces a minor bump, `fix:` a patch, and
-`feat!:` or a `BREAKING CHANGE:` footer a major one. A commit that does not parse
+`feat!:` or a `BREAKING CHANGE:` footer a major one (before 1.0 it raises the
+minor version, as 0.2.0 did). A commit that does not parse
 is silently excluded from the release, so keep the subject clean and put code
 fragments in the body rather than the subject line.
 
