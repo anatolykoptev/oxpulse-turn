@@ -43,6 +43,7 @@
 //! assert_eq!(creds.ice_servers.len(), 2);
 //! ```
 
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -147,7 +148,7 @@ impl std::str::FromStr for IceTransportPolicy {
 
 /// TURN/STUN server entry for ICE negotiation.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct IceServer {
     pub urls: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,7 +159,7 @@ pub struct IceServer {
 
 /// Temporary TURN credentials (coturn REST API compatible).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TurnCredentials {
     pub username: String,
     pub credential: String,
@@ -212,7 +213,7 @@ pub struct TurnCredentials {
 /// let creds = issuer.issue("alice").unwrap();
 /// let relay = issuer.issue_with_policy("bob", IceTransportPolicy::Relay).unwrap();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TurnCredentialIssuer {
     /// `[0]` = active (mint), `[1..]` = alternates (accepted by coturn during rotation overlap).
     /// Wrapped in [`Zeroizing`] so secret bytes are overwritten on drop.
@@ -671,10 +672,105 @@ pub fn try_generate_credentials_with_policy(
     Ok(creds)
 }
 
+// Manual `Debug` impls: secrets and credentials must never reach logs via `{:?}`.
+// (`Zeroizing<String>` derives `Debug` that prints the value in zeroize <= 1.9.0.)
+
+impl fmt::Debug for IceServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IceServer")
+            .field("urls", &self.urls)
+            .field("username", &self.username)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for TurnCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("TurnCredentials");
+        d.field("username", &self.username)
+            .field("credential", &"[REDACTED]")
+            .field("ttl", &self.ttl)
+            .field("ice_servers", &self.ice_servers)
+            .field("ice_transport_policy", &self.ice_transport_policy);
+        #[cfg(feature = "chrono")]
+        d.field("expires_at", &self.expires_at);
+        d.finish()
+    }
+}
+
+impl fmt::Debug for TurnCredentialIssuer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurnCredentialIssuer")
+            .field(
+                "secrets",
+                &format_args!("[REDACTED; {}]", self.secrets.len()),
+            )
+            .field("ttl", &self.ttl)
+            .field("turn_urls", &self.turn_urls)
+            .field("stun_urls", &self.stun_urls)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // --- Debug redaction ---
+
+    #[test]
+    fn issuer_debug_redacts_secrets() {
+        let issuer = TurnCredentialIssuer::new_multi(
+            vec![
+                "CANARY_one_not_a_secret_0123456789abcdef".to_string(),
+                "CANARY_two_not_a_secret_0123456789abcdef".to_string(),
+            ],
+            Duration::from_secs(3600),
+            &["turn:turn.example.com:3478".to_string()],
+            &["stun:stun.example.com:3478".to_string()],
+        )
+        .unwrap();
+        let dbg = format!("{:?}", issuer);
+        assert!(!dbg.contains("CANARY_one"), "secret leaked in Debug: {dbg}");
+        assert!(!dbg.contains("CANARY_two"), "secret leaked in Debug: {dbg}");
+        assert!(
+            dbg.contains("secrets: [REDACTED; 2]"),
+            "unexpected Debug: {dbg}"
+        );
+        assert!(dbg.contains("turn:turn.example.com:3478"));
+    }
+
+    #[test]
+    fn credentials_debug_redacts_credential_but_serde_keeps_it() {
+        let creds = generate_credentials(
+            "test-secret",
+            "user1",
+            Duration::from_secs(3600),
+            &["turn:example.com:3478".to_string()],
+            &[],
+        );
+        let cred = creds.credential.clone();
+        let ice_cred = creds.ice_servers[0].credential.clone().unwrap();
+        let dbg = format!("{:?}", creds);
+        assert!(!dbg.contains(&cred), "credential leaked in Debug: {dbg}");
+        assert!(
+            !dbg.contains(&ice_cred),
+            "ice credential leaked in Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("credential: \"[REDACTED]\""),
+            "unexpected Debug: {dbg}"
+        );
+        assert!(dbg.contains("user1"));
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(json.contains(&cred));
+        assert!(json.contains(&ice_cred));
+    }
 
     // --- Panicking API (backward compat with 0.2.0) ---
 
