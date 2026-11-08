@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/anatolykoptev/oxpulse-turn/compare/v0.2.1...v0.2.2) (2026-11-08)
+
+
+### Bug Fixes
+
+* redact secrets from Debug output of TurnCredentialIssuer and credentials ([#42](https://github.com/anatolykoptev/oxpulse-turn/issues/42)) ([f26aecc](https://github.com/anatolykoptev/oxpulse-turn/commit/f26aecce1acc1d1ca6ae69779eed6d0a0b3912b4))
+
 ## [0.2.1](https://github.com/anatolykoptev/oxpulse-turn/compare/v0.2.0...v0.2.1) (2026-08-07)
 
 
